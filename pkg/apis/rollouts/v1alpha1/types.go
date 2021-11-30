@@ -305,6 +305,9 @@ type CanaryStrategy struct {
 	// scaling down the stable as traffic is increased to canary. When disabled (the default behavior)
 	// the stable ReplicaSet remains fully scaled to support instantaneous aborts.
 	DynamicStableScale bool `json:"dynamicStableScale,omitempty" protobuf:"varint,14,opt,name=dynamicStableScale"`
+	// Assuming the desired number of pods in a stable or canary ReplicaSet is not zero, then make sure it is at least
+	// MinPodsPerRS for High Availability. Only applicable for TrafficRoutedCanary
+	MinPodsPerRS *int32 `json:"minPodsPerRS,omitempty" protobuf:"varint,15,opt,name=minPodsPerRS"`
 }
 
 // AnalysisRunStrategy configuration for the analysis runs and experiments to retain
