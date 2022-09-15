@@ -316,7 +316,7 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 	for _, task := range tasks {
 		wg.Add(1)
 
-		go func(t metricTask) error {
+		go func(t metricTask) {
 			defer wg.Done()
 			//redact secret values from logs
 			logger := logutil.WithRedactor(*logutil.WithAnalysisRun(run).WithField("metric", t.metric.Name), secrets)
@@ -326,9 +326,12 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 			resultsLock.Unlock()
 
 			provider, err := c.newProvider(*logger, t.metric)
+			//Fix for https://github.com/argoproj/argo-rollouts/issues/2024 this error is not bubbled to runMeasurements function
+			//it just stops the go routine to prevent nil pointer usage. Just keeping this simple due to it being a patch for a bug.
+			//We probably want to handle errors in this goroutine in a different way in master but for now just prevent crashing.
 			if err != nil {
 				log.Errorf("Error in getting provider :%v", err)
-				return err
+				return
 			}
 			if metricResult == nil {
 				metricResult = &v1alpha1.MetricResult{
@@ -408,7 +411,7 @@ func (c *Controller) runMeasurements(run *v1alpha1.AnalysisRun, tasks []metricTa
 			resultsLock.Lock()
 			analysisutil.SetResult(run, *metricResult)
 			resultsLock.Unlock()
-			return nil
+
 		}(task)
 	}
 	wg.Wait()
