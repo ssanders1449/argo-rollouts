@@ -7041,6 +7041,15 @@ func (m *NginxTrafficRouting) MarshalToSizedBuffer(dAtA []byte) (int, error) {
 	_ = i
 	var l int
 	_ = l
+	if len(m.AdditionalStableIngresses) > 0 {
+		for iNdEx := len(m.AdditionalStableIngresses) - 1; iNdEx >= 0; iNdEx-- {
+			i -= len(m.AdditionalStableIngresses[iNdEx])
+			copy(dAtA[i:], m.AdditionalStableIngresses[iNdEx])
+			i = encodeVarintGenerated(dAtA, i, uint64(len(m.AdditionalStableIngresses[iNdEx])))
+			i--
+			dAtA[i] = 0x22
+		}
+	}
 	if len(m.AdditionalIngressAnnotations) > 0 {
 		keysForAdditionalIngressAnnotations := make([]string, 0, len(m.AdditionalIngressAnnotations))
 		for k := range m.AdditionalIngressAnnotations {
@@ -10735,6 +10744,12 @@ func (m *NginxTrafficRouting) Size() (n int) {
 			n += mapEntrySize + 1 + sovGenerated(uint64(mapEntrySize))
 		}
 	}
+	if len(m.AdditionalStableIngresses) > 0 {
+		for _, s := range m.AdditionalStableIngresses {
+			l = len(s)
+			n += 1 + l + sovGenerated(uint64(l))
+		}
+	}
 	return n
 }
 
@@ -12554,6 +12569,7 @@ func (this *NginxTrafficRouting) String() string {
 		`AnnotationPrefix:` + fmt.Sprintf("%v", this.AnnotationPrefix) + `,`,
 		`StableIngress:` + fmt.Sprintf("%v", this.StableIngress) + `,`,
 		`AdditionalIngressAnnotations:` + mapStringForAdditionalIngressAnnotations + `,`,
+		`AdditionalStableIngresses:` + fmt.Sprintf("%v", this.AdditionalStableIngresses) + `,`,
 		`}`,
 	}, "")
 	return s
@@ -24051,6 +24067,38 @@ func (m *NginxTrafficRouting) Unmarshal(dAtA []byte) error {
 				}
 			}
 			m.AdditionalIngressAnnotations[mapkey] = mapvalue
+			iNdEx = postIndex
+		case 4:
+			if wireType != 2 {
+				return fmt.Errorf("proto: wrong wireType = %d for field AdditionalStableIngresses", wireType)
+			}
+			var stringLen uint64
+			for shift := uint(0); ; shift += 7 {
+				if shift >= 64 {
+					return ErrIntOverflowGenerated
+				}
+				if iNdEx >= l {
+					return io.ErrUnexpectedEOF
+				}
+				b := dAtA[iNdEx]
+				iNdEx++
+				stringLen |= uint64(b&0x7F) << shift
+				if b < 0x80 {
+					break
+				}
+			}
+			intStringLen := int(stringLen)
+			if intStringLen < 0 {
+				return ErrInvalidLengthGenerated
+			}
+			postIndex := iNdEx + intStringLen
+			if postIndex < 0 {
+				return ErrInvalidLengthGenerated
+			}
+			if postIndex > l {
+				return io.ErrUnexpectedEOF
+			}
+			m.AdditionalStableIngresses = append(m.AdditionalStableIngresses, string(dAtA[iNdEx:postIndex]))
 			iNdEx = postIndex
 		default:
 			iNdEx = preIndex
