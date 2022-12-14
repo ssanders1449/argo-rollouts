@@ -1785,7 +1785,7 @@ func TestMultipleVirtualServiceConfigured(t *testing.T) {
 	assert.Equal(t, false, mvsvc)
 }
 
-//This Testcase validates the reconcileVirtualService using VirtualServices configuration
+// This Testcase validates the reconcileVirtualService using VirtualServices configuration
 func TestMultipleVirtualServiceReconcileWeightsBaseCase(t *testing.T) {
 
 	multipleVirtualService := []v1alpha1.IstioVirtualService{{Name: "vsvc", Routes: []string{"secondary"}, TLSRoutes: []v1alpha1.TLSRoute{{Port: 3000}}}}

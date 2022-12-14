@@ -1265,6 +1265,7 @@ func TestReconcileCanaryCreateErrorAlreadyExistsPatchMultiIngress(t *testing.T) 
 		assert.Equal(t, "patch", actions[5].GetVerb(), "action: patch canary ingress")
 		assert.Equal(t, schema.GroupVersionResource{Group: "extensions", Version: "v1beta1", Resource: "ingresses"}, actions[2].GetResource(), "action: patch canary ingress")
 	}
+}
 
 func TestSetHeaderRoute(t *testing.T) {
 	r := Reconciler{

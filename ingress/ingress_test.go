@@ -299,8 +299,8 @@ func TestSkipIngressWithNoClass(t *testing.T) {
 
 func TestSkipIngressWithNoAnnotationsMultiIngress(t *testing.T) {
 	ings := []*extensionsv1beta1.Ingress{
-		newNginxIngress("test-stable-ingress", 80, "stable-service"),
-		newNginxIngress("test-stable-ingress-additional", 80, "stable-service"),
+		newNginxIngressWithAnnotation("test-stable-ingress", 80, "stable-service"),
+		newNginxIngressWithAnnotation("test-stable-ingress-additional", 80, "stable-service"),
 	}
 	for _, i := range ings {
 		i.Annotations = nil
