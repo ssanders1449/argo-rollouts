@@ -394,3 +394,41 @@ func TestCanaryStepString(t *testing.T) {
 		assert.Equal(t, test.expectedString, CanaryStepString(test.step))
 	}
 }
+
+func TestIsUnpausing(t *testing.T) {
+	ro := newCanaryRollout()
+	ro.Status.Phase = v1alpha1.RolloutPhasePaused
+	ro.Status.Message = "canary pause"
+	ro.Status.PauseConditions = []v1alpha1.PauseCondition{
+		{
+			Reason: v1alpha1.PauseReasonCanaryPauseStep,
+		},
+	}
+	ro.Status.ControllerPause = true
+	status, message := GetRolloutPhase(ro)
+	assert.Equal(t, v1alpha1.RolloutPhasePaused, status)
+	assert.Equal(t, "canary pause", message)
+
+	ro.Status.PauseConditions = nil
+	status, message = GetRolloutPhase(ro)
+	assert.Equal(t, v1alpha1.RolloutPhaseProgressing, status)
+	assert.Equal(t, "waiting for rollout to unpause", message)
+}
+
+func TestShouldVerifyWeight(t *testing.T) {
+	ro := newCanaryRollout()
+	ro.Status.StableRS = "34feab23f"
+	ro.Status.CurrentStepIndex = pointer.Int32Ptr(0)
+	ro.Spec.Strategy.Canary.Steps = []v1alpha1.CanaryStep{{
+		SetWeight: pointer.Int32Ptr(20),
+	}}
+	assert.Equal(t, true, ShouldVerifyWeight(ro))
+
+	ro.Status.StableRS = ""
+	assert.Equal(t, false, ShouldVerifyWeight(ro))
+
+	ro.Status.StableRS = "34feab23f"
+	ro.Status.CurrentStepIndex = nil
+	ro.Spec.Strategy.Canary.Steps = nil
+	assert.Equal(t, false, ShouldVerifyWeight(ro))
+}

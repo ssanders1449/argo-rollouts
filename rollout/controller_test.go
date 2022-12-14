@@ -13,7 +13,6 @@ import (
 	"github.com/ghodss/yaml"
 	log "github.com/sirupsen/logrus"
 	"github.com/stretchr/testify/assert"
-	"github.com/undefinedlabs/go-mpatch"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	extensionsv1beta1 "k8s.io/api/extensions/v1beta1"
@@ -35,7 +34,6 @@ import (
 	"k8s.io/client-go/tools/cache"
 	"k8s.io/client-go/util/workqueue"
 	corev1defaults "k8s.io/kubernetes/pkg/apis/core/v1"
-	"k8s.io/kubernetes/pkg/controller"
 	"k8s.io/utils/pointer"
 
 	"github.com/argoproj/argo-rollouts/controller/metrics"
@@ -48,12 +46,15 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
 	"github.com/argoproj/argo-rollouts/utils/defaults"
+	"github.com/argoproj/argo-rollouts/utils/hash"
 	ingressutil "github.com/argoproj/argo-rollouts/utils/ingress"
 	istioutil "github.com/argoproj/argo-rollouts/utils/istio"
 	"github.com/argoproj/argo-rollouts/utils/queue"
 	"github.com/argoproj/argo-rollouts/utils/record"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 	rolloututil "github.com/argoproj/argo-rollouts/utils/rollout"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
+	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
 var (
@@ -103,9 +104,8 @@ type fixture struct {
 	unfreezeTime    func() error
 
 	// events holds all the K8s Event Reasons emitted during the run
-	events                   []string
-	fakeTrafficRouting       []*mocks.TrafficRoutingReconciler
-	fakeSingleTrafficRouting *mocks.TrafficRoutingReconciler
+	events             []string
+	fakeTrafficRouting *mocks.TrafficRoutingReconciler
 }
 
 func newFixture(t *testing.T) *fixture {
@@ -115,12 +115,13 @@ func newFixture(t *testing.T) *fixture {
 	f.kubeobjects = []runtime.Object{}
 	f.enqueuedObjects = make(map[string]int)
 	now := time.Now()
-	patch, err := mpatch.PatchMethod(time.Now, func() time.Time { return now })
-	assert.NoError(t, err)
-	f.unfreezeTime = patch.Unpatch
+	timeutil.Now = func() time.Time { return now }
+	f.unfreezeTime = func() error {
+		timeutil.Now = time.Now
+		return nil
+	}
 
-	f.fakeTrafficRouting = newFakeTrafficRoutingReconciler()
-	f.fakeSingleTrafficRouting = newFakeSingleTrafficRoutingReconciler()
+	f.fakeTrafficRouting = newFakeSingleTrafficRoutingReconciler()
 	return f
 }
 
@@ -178,12 +179,34 @@ func newPausedCondition(isPaused bool) (v1alpha1.RolloutCondition, string) {
 		status = corev1.ConditionFalse
 	}
 	condition := v1alpha1.RolloutCondition{
-		LastTransitionTime: metav1.Now(),
-		LastUpdateTime:     metav1.Now(),
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
 		Message:            conditions.RolloutPausedMessage,
 		Reason:             conditions.RolloutPausedReason,
 		Status:             status,
 		Type:               v1alpha1.RolloutPaused,
+	}
+	conditionBytes, err := json.Marshal(condition)
+	if err != nil {
+		panic(err)
+	}
+	return condition, string(conditionBytes)
+}
+
+func newHealthyCondition(isHealthy bool) (v1alpha1.RolloutCondition, string) {
+	status := corev1.ConditionTrue
+	msg := conditions.RolloutHealthyMessage
+	if !isHealthy {
+		status = corev1.ConditionFalse
+		msg = conditions.RolloutNotHealthyMessage
+	}
+	condition := v1alpha1.RolloutCondition{
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
+		Message:            msg,
+		Reason:             conditions.RolloutHealthyReason,
+		Status:             status,
+		Type:               v1alpha1.RolloutHealthy,
 	}
 	conditionBytes, err := json.Marshal(condition)
 	if err != nil {
@@ -198,8 +221,8 @@ func newCompletedCondition(isCompleted bool) (v1alpha1.RolloutCondition, string)
 		status = corev1.ConditionFalse
 	}
 	condition := v1alpha1.RolloutCondition{
-		LastTransitionTime: metav1.Now(),
-		LastUpdateTime:     metav1.Now(),
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
 		Message:            conditions.RolloutCompletedReason,
 		Reason:             conditions.RolloutCompletedReason,
 		Status:             status,
@@ -228,6 +251,9 @@ func newProgressingCondition(reason string, resourceObj runtime.Object, optional
 		}
 		if reason == conditions.NewRSAvailableReason {
 			msg = fmt.Sprintf(conditions.ReplicaSetCompletedMessage, resource.Name)
+		}
+		if reason == conditions.ReplicaSetNotAvailableReason {
+			msg = conditions.NotAvailableMessage
 		}
 	case *v1alpha1.Rollout:
 		if reason == conditions.ReplicaSetUpdatedReason {
@@ -276,8 +302,8 @@ func newProgressingCondition(reason string, resourceObj runtime.Object, optional
 	}
 
 	condition := v1alpha1.RolloutCondition{
-		LastTransitionTime: metav1.Now(),
-		LastUpdateTime:     metav1.Now(),
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
 		Message:            msg,
 		Reason:             reason,
 		Status:             status,
@@ -300,8 +326,8 @@ func newAvailableCondition(available bool) (v1alpha1.RolloutCondition, string) {
 
 	}
 	condition := v1alpha1.RolloutCondition{
-		LastTransitionTime: metav1.Now(),
-		LastUpdateTime:     metav1.Now(),
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
 		Message:            message,
 		Reason:             conditions.AvailableReason,
 		Status:             status,
@@ -311,33 +337,57 @@ func newAvailableCondition(available bool) (v1alpha1.RolloutCondition, string) {
 	return condition, string(conditionBytes)
 }
 
-func generateConditionsPatch(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string) string {
+func generateConditionsPatch(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isCompleted bool) string {
 	_, availableCondition := newAvailableCondition(available)
 	_, progressingCondition := newProgressingCondition(progressingReason, progressingResource, progressingMessage)
+	_, completedCondition := newCompletedCondition(isCompleted)
 	if availableConditionFirst {
-		return fmt.Sprintf("[%s, %s]", availableCondition, progressingCondition)
+		return fmt.Sprintf("[%s, %s, %s]", availableCondition, progressingCondition, completedCondition)
 	}
-	return fmt.Sprintf("[%s, %s]", progressingCondition, availableCondition)
+	return fmt.Sprintf("[%s, %s, %s]", progressingCondition, availableCondition, completedCondition)
 }
 
-func generateConditionsPatchWithPause(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isPaused bool) string {
+func generateConditionsPatchWithPause(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isPaused bool, isCompleted bool) string {
 	_, availableCondition := newAvailableCondition(available)
 	_, progressingCondition := newProgressingCondition(progressingReason, progressingResource, progressingMessage)
 	_, pauseCondition := newPausedCondition(isPaused)
+	_, completedCondition := newCompletedCondition(isCompleted)
 	if availableConditionFirst {
-		return fmt.Sprintf("[%s, %s, %s]", availableCondition, progressingCondition, pauseCondition)
+		return fmt.Sprintf("[%s, %s, %s, %s]", availableCondition, completedCondition, progressingCondition, pauseCondition)
 	}
-	return fmt.Sprintf("[%s, %s, %s]", progressingCondition, pauseCondition, availableCondition)
+	return fmt.Sprintf("[%s, %s, %s, %s]", progressingCondition, pauseCondition, availableCondition, completedCondition)
 }
 
-func generateConditionsPatchWithComplete(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isCompleted bool) string {
+func generateConditionsPatchWithHealthy(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isHealthy bool, isCompleted bool) string {
+	_, availableCondition := newAvailableCondition(available)
+	_, progressingCondition := newProgressingCondition(progressingReason, progressingResource, progressingMessage)
+	_, healthyCondition := newHealthyCondition(isHealthy)
+	_, completedCondition := newCompletedCondition(isCompleted)
+	if availableConditionFirst {
+		return fmt.Sprintf("[%s, %s, %s, %s]", availableCondition, completedCondition, healthyCondition, progressingCondition)
+	}
+	return fmt.Sprintf("[%s, %s, %s, %s]", completedCondition, healthyCondition, progressingCondition, availableCondition)
+}
+
+func generateConditionsPatchWithCompleted(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isCompleted bool) string {
 	_, availableCondition := newAvailableCondition(available)
 	_, progressingCondition := newProgressingCondition(progressingReason, progressingResource, progressingMessage)
 	_, completeCondition := newCompletedCondition(isCompleted)
 	if availableConditionFirst {
-		return fmt.Sprintf("[%s, %s, %s]", availableCondition, completeCondition, progressingCondition)
+		return fmt.Sprintf("[%s, %s, %s]", availableCondition, progressingCondition, completeCondition)
 	}
-	return fmt.Sprintf("[%s, %s, %s]", completeCondition, progressingCondition, availableCondition)
+	return fmt.Sprintf("[%s, %s, %s]", progressingCondition, availableCondition, completeCondition)
+}
+
+func generateConditionsPatchWithCompletedHealthy(available bool, progressingReason string, progressingResource runtime.Object, availableConditionFirst bool, progressingMessage string, isHealthy bool, isCompleted bool) string {
+	_, completedCondition := newCompletedCondition(isCompleted)
+	_, availableCondition := newAvailableCondition(available)
+	_, progressingCondition := newProgressingCondition(progressingReason, progressingResource, progressingMessage)
+	_, healthyCondition := newHealthyCondition(isHealthy)
+	if availableConditionFirst {
+		return fmt.Sprintf("[%s, %s, %s, %s]", availableCondition, healthyCondition, completedCondition, progressingCondition)
+	}
+	return fmt.Sprintf("[%s, %s, %s, %s]", healthyCondition, completedCondition, progressingCondition, availableCondition)
 }
 
 func updateConditionsPatch(r v1alpha1.Rollout, newCondition v1alpha1.RolloutCondition) string {
@@ -347,7 +397,7 @@ func updateConditionsPatch(r v1alpha1.Rollout, newCondition v1alpha1.RolloutCond
 }
 
 // func updateBlueGreenRolloutStatus(r *v1alpha1.Rollout, preview, active string, availableReplicas, updatedReplicas, hpaReplicas int32, pause bool, available bool, progressingStatus string) *v1alpha1.Rollout {
-func updateBlueGreenRolloutStatus(r *v1alpha1.Rollout, preview, active, stable string, availableReplicas, updatedReplicas, totalReplicas, hpaReplicas int32, pause bool, available bool) *v1alpha1.Rollout {
+func updateBlueGreenRolloutStatus(r *v1alpha1.Rollout, preview, active, stable string, availableReplicas, updatedReplicas, totalReplicas, hpaReplicas int32, pause bool, available bool, isCompleted bool) *v1alpha1.Rollout {
 	newRollout := updateBaseRolloutStatus(r, availableReplicas, updatedReplicas, totalReplicas, hpaReplicas)
 	selector := newRollout.Spec.Selector.DeepCopy()
 	if active != "" {
@@ -359,8 +409,10 @@ func updateBlueGreenRolloutStatus(r *v1alpha1.Rollout, preview, active, stable s
 	newRollout.Status.StableRS = stable
 	cond, _ := newAvailableCondition(available)
 	newRollout.Status.Conditions = append(newRollout.Status.Conditions, cond)
+	completeCond, _ := newCompletedCondition(isCompleted)
+	newRollout.Status.Conditions = append(newRollout.Status.Conditions, completeCond)
 	if pause {
-		now := metav1.Now()
+		now := timeutil.MetaNow()
 		cond := v1alpha1.PauseCondition{
 			Reason:    v1alpha1.PauseReasonBlueGreenPause,
 			StartTime: now,
@@ -398,7 +450,7 @@ func updateBaseRolloutStatus(r *v1alpha1.Rollout, availableReplicas, updatedRepl
 }
 
 func newReplicaSet(r *v1alpha1.Rollout, replicas int) *appsv1.ReplicaSet {
-	podHash := controller.ComputeHash(&r.Spec.Template, r.Status.CollisionCount)
+	podHash := hash.ComputePodTemplateHash(&r.Spec.Template, r.Status.CollisionCount)
 	rsLabels := map[string]string{
 		v1alpha1.DefaultRolloutUniqueLabelKey: podHash,
 	}
@@ -565,7 +617,7 @@ func (f *fixture) newController(resync resyncFunc) (*Controller, informers.Share
 			return nil, nil
 		}
 		var reconcilers = []trafficrouting.TrafficRoutingReconciler{}
-		reconcilers = append(reconcilers, f.fakeSingleTrafficRouting)
+		reconcilers = append(reconcilers, f.fakeTrafficRouting)
 		return reconcilers, nil
 	}
 
@@ -892,7 +944,7 @@ func (f *fixture) verifyPatchedReplicaSet(index int, scaleDownDelaySeconds int32
 	if !ok {
 		assert.Fail(f.t, "Expected Patch action, not %s", action.GetVerb())
 	}
-	now := metav1.Now().Add(time.Duration(scaleDownDelaySeconds) * time.Second).UTC().Format(time.RFC3339)
+	now := timeutil.Now().Add(time.Duration(scaleDownDelaySeconds) * time.Second).UTC().Format(time.RFC3339)
 	patch := fmt.Sprintf(addScaleDownAtAnnotationsPatch, v1alpha1.DefaultReplicaSetScaleDownDeadlineAnnotationKey, now)
 	assert.Equal(f.t, string(patchAction.GetPatch()), patch)
 }
@@ -1174,7 +1226,7 @@ func TestRequeueStuckRollout(t *testing.T) {
 
 		if progressingConditionReason != "" {
 			lastUpdated := metav1.Time{
-				Time: metav1.Now().Add(-10 * time.Second),
+				Time: timeutil.MetaNow().Add(-10 * time.Second),
 			}
 			r.Status.Conditions = []v1alpha1.RolloutCondition{{
 				Type:           v1alpha1.RolloutProgressing,
@@ -1297,7 +1349,7 @@ func TestPodTemplateHashEquivalence(t *testing.T) {
 	var err error
 	// NOTE: This test will fail on every k8s library upgrade.
 	// To fix it, update expectedReplicaSetName to match the new hash.
-	expectedReplicaSetName := "guestbook-586d86c77b"
+	expectedReplicaSetName := "guestbook-6c5667f666"
 
 	r1 := newBlueGreenRollout("guestbook", 1, nil, "active", "")
 	r1Resources := `
@@ -1386,6 +1438,8 @@ func TestComputeHashChangeTolerationBlueGreen(t *testing.T) {
 	conditions.SetRolloutCondition(&r.Status, availableCondition)
 	progressingCondition, _ := newProgressingCondition(conditions.ReplicaSetUpdatedReason, rs, "")
 	conditions.SetRolloutCondition(&r.Status, progressingCondition)
+	completedCondition, _ := newCompletedCondition(true)
+	conditions.SetRolloutCondition(&r.Status, completedCondition)
 	r.Status.Phase, r.Status.Message = rolloututil.CalculateRolloutPhase(r.Spec, r.Status)
 
 	podTemplate := corev1.PodTemplate{
@@ -1430,6 +1484,8 @@ func TestComputeHashChangeTolerationCanary(t *testing.T) {
 	conditions.SetRolloutCondition(&r.Status, availableCondition)
 	progressingCondition, _ := newProgressingCondition(conditions.ReplicaSetUpdatedReason, rs, "")
 	conditions.SetRolloutCondition(&r.Status, progressingCondition)
+	completedCondition, _ := newCompletedCondition(true)
+	conditions.SetRolloutCondition(&r.Status, completedCondition)
 
 	podTemplate := corev1.PodTemplate{
 		Template: rs.Spec.Template,
@@ -1457,7 +1513,7 @@ func TestSwitchBlueGreenToCanary(t *testing.T) {
 	activeSvc := newService("active", 80, nil, r)
 	rs := newReplicaSetWithStatus(r, 1, 1)
 	rsPodHash := rs.Labels[v1alpha1.DefaultRolloutUniqueLabelKey]
-	r = updateBlueGreenRolloutStatus(r, "", rsPodHash, rsPodHash, 1, 1, 1, 1, false, true)
+	r = updateBlueGreenRolloutStatus(r, "", rsPodHash, rsPodHash, 1, 1, 1, 1, false, true, false)
 	// StableRS is set to avoid running the migration code. When .status.canary.stableRS is removed, the line below can be deleted
 	//r.Status.Canary.StableRS = rsPodHash
 	r.Spec.Strategy.BlueGreen = nil
@@ -1475,7 +1531,7 @@ func TestSwitchBlueGreenToCanary(t *testing.T) {
 	f.run(getKey(r, t))
 	patch := f.getPatchedRollout(i)
 
-	addedConditions := generateConditionsPatch(true, conditions.ReplicaSetUpdatedReason, rs, true, "")
+	addedConditions := generateConditionsPatch(true, conditions.ReplicaSetUpdatedReason, rs, true, "", true)
 	expectedPatch := fmt.Sprintf(`{
 			"status": {
 				"blueGreen": {
@@ -1498,8 +1554,8 @@ func newInvalidSpecCondition(reason string, resourceObj runtime.Object, optional
 	}
 
 	condition := v1alpha1.RolloutCondition{
-		LastTransitionTime: metav1.Now(),
-		LastUpdateTime:     metav1.Now(),
+		LastTransitionTime: timeutil.MetaNow(),
+		LastUpdateTime:     timeutil.MetaNow(),
 		Message:            msg,
 		Reason:             reason,
 		Status:             status,
@@ -1656,6 +1712,8 @@ func TestGetReferencedIngressesNginx(t *testing.T) {
 	defer f.Close()
 
 	t.Run("get referenced Nginx ingress - fail", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
 		c, _, _ := f.newController(noResyncPeriodFunc)
 		roCtx, err := c.newRolloutContext(r)
 		assert.NoError(t, err)
@@ -1665,6 +1723,8 @@ func TestGetReferencedIngressesNginx(t *testing.T) {
 	})
 
 	t.Run("get referenced Nginx ingress - success", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
 		ingress := &extensionsv1beta1.Ingress{
 			ObjectMeta: metav1.ObjectMeta{
 				Name:      "nginx-ingress-name",
@@ -1678,6 +1738,222 @@ func TestGetReferencedIngressesNginx(t *testing.T) {
 		_, err = roCtx.getReferencedIngresses()
 		assert.NoError(t, err)
 	})
+}
+func TestGetReferencedIngressesNginxMultiIngress(t *testing.T) {
+	f := newFixture(t)
+	defer f.Close()
+	r := newCanaryRollout("rollout", 1, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	r.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+		Nginx: &v1alpha1.NginxTrafficRouting{
+			StableIngress:             "nginx-ingress-name",
+			AdditionalStableIngresses: []string{"nginx-ingress-additional"},
+		},
+	}
+	r.Namespace = metav1.NamespaceDefault
+	defer f.Close()
+
+	t.Run("get referenced Nginx ingress - fail on secondary when both missing", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getReferencedIngresses()
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "nginx", "AdditionalStableIngresses"), "nginx-ingress-name", "ingress.extensions \"nginx-ingress-additional\" not found")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("get referenced Nginx ingress - fail on primary when additional present", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
+		ingressAdditional := &extensionsv1beta1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-ingress-additional",
+				Namespace: metav1.NamespaceDefault,
+			},
+		}
+		f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ingressAdditional))
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getReferencedIngresses()
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "nginx", "stableIngress"), "nginx-ingress-name", "ingress.extensions \"nginx-ingress-name\" not found")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("get referenced Nginx ingress - fail on secondary when only secondary missing", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
+		ingress := &extensionsv1beta1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-ingress-name",
+				Namespace: metav1.NamespaceDefault,
+			},
+		}
+		f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ingress))
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getReferencedIngresses()
+		if err == nil {
+			fmt.Println("ERROR IS NIL")
+		}
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "nginx", "AdditionalStableIngresses"), "nginx-ingress-name", "ingress.extensions \"nginx-ingress-additional\" not found")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("get referenced Nginx ingress - success", func(t *testing.T) {
+		// clear fixture
+		f.ingressLister = []*ingressutil.Ingress{}
+		ingress := &extensionsv1beta1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-ingress-name",
+				Namespace: metav1.NamespaceDefault,
+			},
+		}
+		ingressAdditional := &extensionsv1beta1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{
+				Name:      "nginx-ingress-additional",
+				Namespace: metav1.NamespaceDefault,
+			},
+		}
+		f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ingress))
+		f.ingressLister = append(f.ingressLister, ingressutil.NewLegacyIngress(ingressAdditional))
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getReferencedIngresses()
+		assert.NoError(t, err)
+	})
+}
+
+func TestGetReferencedAppMeshResources(t *testing.T) {
+	r := newCanaryRollout("rollout", 1, nil, nil, nil, intstr.FromInt(0), intstr.FromInt(1))
+	r.Spec.Strategy.Canary.TrafficRouting = &v1alpha1.RolloutTrafficRouting{
+		AppMesh: &v1alpha1.AppMeshTrafficRouting{
+			VirtualService: &v1alpha1.AppMeshVirtualService{
+				Name:   "mysvc",
+				Routes: []string{"primary"},
+			},
+			VirtualNodeGroup: &v1alpha1.AppMeshVirtualNodeGroup{
+				CanaryVirtualNodeRef: &v1alpha1.AppMeshVirtualNodeReference{
+					Name: "mysvc-canary-vn",
+				},
+				StableVirtualNodeRef: &v1alpha1.AppMeshVirtualNodeReference{
+					Name: "mysvc-stable-vn",
+				},
+			},
+		},
+	}
+	r.Namespace = "default"
+
+	t.Run("should return error when virtual-service is not defined on rollout", func(t *testing.T) {
+		f := newFixture(t)
+		defer f.Close()
+
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		rCopy := r.DeepCopy()
+		rCopy.Spec.Strategy.Canary.TrafficRouting.AppMesh.VirtualService = nil
+		roCtx, err := c.newRolloutContext(rCopy)
+		assert.NoError(t, err)
+		_, err = roCtx.getRolloutReferencedResources()
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "appmesh", "virtualService"), "null", "must provide virtual-service")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("should return error when virtual-service is not-found", func(t *testing.T) {
+		f := newFixture(t)
+		defer f.Close()
+
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getRolloutReferencedResources()
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "appmesh", "virtualService"), "mysvc.default", "virtualservices.appmesh.k8s.aws \"mysvc\" not found")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("should return error when virtual-router is not-found", func(t *testing.T) {
+		f := newFixture(t)
+		defer f.Close()
+
+		vsvc := `
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualService
+metadata:
+  name: mysvc
+  namespace: default
+spec:
+  provider:
+    virtualRouter:
+      virtualRouterRef:
+        name: mysvc-vrouter
+`
+		uVsvc := unstructuredutil.StrToUnstructuredUnsafe(vsvc)
+		f.objects = append(f.objects, uVsvc)
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		_, err = roCtx.getRolloutReferencedResources()
+		expectedErr := field.Invalid(field.NewPath("spec", "strategy", "canary", "trafficRouting", "appmesh", "virtualService"), "mysvc.default", "virtualrouters.appmesh.k8s.aws \"mysvc-vrouter\" not found")
+		assert.Equal(t, expectedErr.Error(), err.Error())
+	})
+
+	t.Run("get referenced App Mesh - success", func(t *testing.T) {
+		f := newFixture(t)
+		defer f.Close()
+
+		vsvc := `
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualService
+metadata:
+  name: mysvc
+  namespace: default
+spec:
+  provider:
+    virtualRouter:
+      virtualRouterRef:
+        name: mysvc-vrouter
+`
+
+		vrouter := `
+apiVersion: appmesh.k8s.aws/v1beta2
+kind: VirtualRouter
+metadata:
+  name: mysvc-vrouter
+  namespace: default
+spec:
+  listeners:
+    - portMapping:
+        port: 8080
+        protocol: http
+  routes:
+    - name: primary
+      httpRoute:
+        match:
+          prefix: /
+        action:
+          weightedTargets:
+            - virtualNodeRef:
+                name: mysvc-canary-vn
+              weight: 0
+            - virtualNodeRef:
+                name: mysvc-stable-vn
+              weight: 100
+`
+
+		uVsvc := unstructuredutil.StrToUnstructuredUnsafe(vsvc)
+		uVrouter := unstructuredutil.StrToUnstructuredUnsafe(vrouter)
+		f.objects = append(f.objects, uVsvc, uVrouter)
+		c, _, _ := f.newController(noResyncPeriodFunc)
+		roCtx, err := c.newRolloutContext(r)
+		assert.NoError(t, err)
+		refRsources, err := roCtx.getRolloutReferencedResources()
+		assert.NoError(t, err)
+		assert.Len(t, refRsources.AppMeshResources, 1)
+		assert.Equal(t, refRsources.AppMeshResources[0].GetKind(), "VirtualRouter")
+	})
+
 }
 
 func TestGetAmbassadorMappings(t *testing.T) {

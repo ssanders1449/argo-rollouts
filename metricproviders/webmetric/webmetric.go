@@ -12,13 +12,13 @@ import (
 	"strings"
 	"time"
 
-	metricutil "github.com/argoproj/argo-rollouts/utils/metric"
 	log "github.com/sirupsen/logrus"
-	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/util/jsonpath"
 
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/utils/evaluate"
+	metricutil "github.com/argoproj/argo-rollouts/utils/metric"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 )
 
 const (
@@ -39,8 +39,13 @@ func (p *Provider) Type() string {
 	return ProviderType
 }
 
+// GetMetadata returns any additional metadata which needs to be stored & displayed as part of the metrics result.
+func (p *Provider) GetMetadata(metric v1alpha1.Metric) map[string]string {
+	return nil
+}
+
 func (p *Provider) Run(run *v1alpha1.AnalysisRun, metric v1alpha1.Metric) v1alpha1.Measurement {
-	startTime := metav1.Now()
+	startTime := timeutil.MetaNow()
 
 	// Measurement to pass back
 	measurement := v1alpha1.Measurement{
@@ -91,7 +96,7 @@ func (p *Provider) Run(run *v1alpha1.AnalysisRun, metric v1alpha1.Metric) v1alph
 
 	measurement.Value = value
 	measurement.Phase = status
-	finishedTime := metav1.Now()
+	finishedTime := timeutil.MetaNow()
 	measurement.FinishedAt = &finishedTime
 
 	return measurement

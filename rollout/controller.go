@@ -8,6 +8,9 @@ import (
 	"strconv"
 	"time"
 
+	"k8s.io/apimachinery/pkg/runtime/schema"
+
+	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts"
 	smiclientset "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
 	log "github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
@@ -40,6 +43,7 @@ import (
 	listers "github.com/argoproj/argo-rollouts/pkg/client/listers/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/ambassador"
+	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/appmesh"
 	"github.com/argoproj/argo-rollouts/rollout/trafficrouting/istio"
 	analysisutil "github.com/argoproj/argo-rollouts/utils/analysis"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
@@ -52,6 +56,7 @@ import (
 	"github.com/argoproj/argo-rollouts/utils/record"
 	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
 	serviceutil "github.com/argoproj/argo-rollouts/utils/service"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
 )
 
@@ -243,6 +248,7 @@ func NewController(cfg ControllerConfig) *Controller {
 			if ro := unstructuredutil.ObjectToRollout(obj); ro != nil {
 				logCtx := logutil.WithRollout(ro)
 				logCtx.Info("rollout deleted")
+				controller.metricsServer.Remove(ro.Namespace, ro.Name, logutil.RolloutKey)
 				// Rollout is deleted, queue up the referenced Service and/or DestinationRules so
 				// that the rollouts-pod-template-hash can be cleared from each
 				for _, s := range serviceutil.GetRolloutServiceKeys(ro) {
@@ -251,6 +257,7 @@ func NewController(cfg ControllerConfig) *Controller {
 				for _, key := range istioutil.GetRolloutDesinationRuleKeys(ro) {
 					controller.IstioController.EnqueueDestinationRule(key)
 				}
+				controller.recorder.Eventf(ro, record.EventOptions{EventReason: conditions.RolloutDeletedReason}, conditions.RolloutDeletedMessage, ro.Name, ro.Namespace)
 			}
 		},
 	})
@@ -341,7 +348,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 // with the current status of the resource.
 func (c *Controller) syncHandler(key string) error {
 	ctx := context.TODO()
-	startTime := time.Now()
+	startTime := timeutil.Now()
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err
@@ -389,7 +396,10 @@ func (c *Controller) syncHandler(key string) error {
 	if rollout.Spec.Replicas == nil {
 		logCtx.Info("Defaulting .spec.replica to 1")
 		r.Spec.Replicas = pointer.Int32Ptr(defaults.DefaultReplicas)
-		_, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Update(ctx, r, metav1.UpdateOptions{})
+		newRollout, err := c.argoprojclientset.ArgoprojV1alpha1().Rollouts(r.Namespace).Update(ctx, r, metav1.UpdateOptions{})
+		if err == nil {
+			c.writeBackToInformer(newRollout)
+		}
 		return err
 	}
 
@@ -414,6 +424,19 @@ func (c *Controller) writeBackToInformer(ro *v1alpha1.Rollout) {
 		return
 	}
 	un := unstructured.Unstructured{Object: obj}
+	// With code-gen tools the argoclientset is generated and the update method here is removing typemetafields
+	// which the notification controller expects when it converts rolloutobject to toUnstructured and if not present
+	// and that throws an error "Failed to process: Object 'Kind' is missing in ..."
+	// Fixing this here as the informer is shared by notification controller by updating typemetafileds.
+	// TODO: Need to revisit this in the future and maybe we should have a dedicated informer for notification
+	gvk := un.GetObjectKind().GroupVersionKind()
+	if len(gvk.Version) == 0 || len(gvk.Group) == 0 || len(gvk.Kind) == 0 {
+		un.GetObjectKind().SetGroupVersionKind(schema.GroupVersionKind{
+			Group:   v1alpha1.SchemeGroupVersion.Group,
+			Kind:    rollouts.RolloutKind,
+			Version: v1alpha1.SchemeGroupVersion.Version,
+		})
+	}
 	err = c.rolloutsInformer.GetStore().Update(&un)
 	if err != nil {
 		logCtx.Errorf("failed to update informer store: %v", err)
@@ -429,7 +452,7 @@ func (c *Controller) newRolloutContext(rollout *v1alpha1.Rollout) (*rolloutConte
 	}
 
 	newRS := replicasetutil.FindNewReplicaSet(rollout, rsList)
-	olderRSs := replicasetutil.FindOldReplicaSets(rollout, rsList)
+	olderRSs := replicasetutil.FindOldReplicaSets(rollout, rsList, newRS)
 	stableRS := replicasetutil.GetStableRS(rollout, newRS, olderRSs)
 	otherRSs := replicasetutil.GetOtherRSs(rollout, newRS, stableRS, rsList)
 
@@ -553,7 +576,47 @@ func (c *rolloutContext) getRolloutReferencedResources() (*validation.Referenced
 	}
 	refResources.AmbassadorMappings = ambassadorMappings
 
+	appmeshResources, err := c.getReferencedAppMeshResources()
+	if err != nil {
+		return nil, err
+	}
+	refResources.AppMeshResources = appmeshResources
+
 	return &refResources, nil
+}
+
+func (c *rolloutContext) getReferencedAppMeshResources() ([]unstructured.Unstructured, error) {
+	ctx := context.TODO()
+	appmeshClient := appmesh.NewResourceClient(c.dynamicclientset)
+	rollout := c.rollout
+	refResources := []unstructured.Unstructured{}
+	if rollout.Spec.Strategy.Canary != nil {
+		canary := rollout.Spec.Strategy.Canary
+		if canary.TrafficRouting != nil && canary.TrafficRouting.AppMesh != nil {
+			fldPath := field.NewPath("spec", "strategy", "canary", "trafficRouting", "appmesh", "virtualService")
+			tr := canary.TrafficRouting.AppMesh
+			if tr.VirtualService == nil {
+				return nil, field.Invalid(fldPath, nil, "must provide virtual-service")
+			}
+
+			vsvc, err := appmeshClient.GetVirtualServiceCR(ctx, c.rollout.Namespace, tr.VirtualService.Name)
+			if err != nil {
+				if k8serrors.IsNotFound(err) {
+					return nil, field.Invalid(fldPath, fmt.Sprintf("%s.%s", tr.VirtualService.Name, c.rollout.Namespace), err.Error())
+				}
+				return nil, err
+			}
+			vr, err := appmeshClient.GetVirtualRouterCRForVirtualService(ctx, vsvc)
+			if err != nil {
+				if k8serrors.IsNotFound(err) {
+					return nil, field.Invalid(fldPath, fmt.Sprintf("%s.%s", tr.VirtualService.Name, c.rollout.Namespace), err.Error())
+				}
+				return nil, err
+			}
+			refResources = append(refResources, *vr)
+		}
+	}
+	return refResources, nil
 }
 
 func (c *rolloutContext) getAmbassadorMappings() ([]unstructured.Unstructured, error) {
@@ -584,67 +647,58 @@ func (c *rolloutContext) getAmbassadorMappings() ([]unstructured.Unstructured, e
 }
 
 func (c *rolloutContext) getReferencedServices() (*[]validation.ServiceWithType, error) {
-	services := []validation.ServiceWithType{}
-	if c.rollout.Spec.Strategy.BlueGreen != nil {
-		if c.rollout.Spec.Strategy.BlueGreen.ActiveService != "" {
-			activeSvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.ActiveService)
-			if k8serrors.IsNotFound(err) {
-				fldPath := validation.GetServiceWithTypeFieldPath(validation.ActiveService)
-				return nil, field.Invalid(fldPath, c.rollout.Spec.Strategy.BlueGreen.ActiveService, err.Error())
-			}
-			if err != nil {
-				return nil, err
-			}
-			services = append(services, validation.ServiceWithType{
-				Service: activeSvc,
-				Type:    validation.ActiveService,
-			})
+	var services []validation.ServiceWithType
+	if bluegreenSpec := c.rollout.Spec.Strategy.BlueGreen; bluegreenSpec != nil {
+		if service, err := c.getReferencedService(bluegreenSpec.ActiveService, validation.ActiveService); service != nil {
+			services = append(services, *service)
+		} else if err != nil {
+			return nil, err
 		}
-		if c.rollout.Spec.Strategy.BlueGreen.PreviewService != "" {
-			previewSvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.BlueGreen.PreviewService)
-			if k8serrors.IsNotFound(err) {
-				fldPath := validation.GetServiceWithTypeFieldPath(validation.PreviewService)
-				return nil, field.Invalid(fldPath, c.rollout.Spec.Strategy.BlueGreen.PreviewService, err.Error())
-			}
-			if err != nil {
-				return nil, err
-			}
-			services = append(services, validation.ServiceWithType{
-				Service: previewSvc,
-				Type:    validation.PreviewService,
-			})
+		if service, err := c.getReferencedService(bluegreenSpec.PreviewService, validation.PreviewService); service != nil {
+			services = append(services, *service)
+		} else if err != nil {
+			return nil, err
 		}
-	} else if c.rollout.Spec.Strategy.Canary != nil {
-		if c.rollout.Spec.Strategy.Canary.StableService != "" {
-			stableSvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.Canary.StableService)
-			if k8serrors.IsNotFound(err) {
-				fldPath := validation.GetServiceWithTypeFieldPath(validation.StableService)
-				return nil, field.Invalid(fldPath, c.rollout.Spec.Strategy.Canary.StableService, err.Error())
-			}
-			if err != nil {
-				return nil, err
-			}
-			services = append(services, validation.ServiceWithType{
-				Service: stableSvc,
-				Type:    validation.StableService,
-			})
+	} else if canarySpec := c.rollout.Spec.Strategy.Canary; canarySpec != nil {
+		if service, err := c.getReferencedService(canarySpec.StableService, validation.StableService); service != nil {
+			services = append(services, *service)
+		} else if err != nil {
+			return nil, err
 		}
-		if c.rollout.Spec.Strategy.Canary.CanaryService != "" {
-			canarySvc, err := c.servicesLister.Services(c.rollout.Namespace).Get(c.rollout.Spec.Strategy.Canary.CanaryService)
-			if k8serrors.IsNotFound(err) {
-				fldPath := validation.GetServiceWithTypeFieldPath(validation.CanaryService)
-				return nil, field.Invalid(fldPath, c.rollout.Spec.Strategy.Canary.CanaryService, err.Error())
-			}
-			if err != nil {
+		if service, err := c.getReferencedService(canarySpec.CanaryService, validation.CanaryService); service != nil {
+			services = append(services, *service)
+		} else if err != nil {
+			return nil, err
+		}
+		if canarySpec.PingPong != nil {
+			if service, err := c.getReferencedService(canarySpec.PingPong.PingService, validation.PingService); service != nil {
+				services = append(services, *service)
+			} else if err != nil {
 				return nil, err
 			}
-			services = append(services, validation.ServiceWithType{
-				Service: canarySvc,
-				Type:    validation.CanaryService,
-			})
+			if service, err := c.getReferencedService(canarySpec.PingPong.PongService, validation.PongService); service != nil {
+				services = append(services, *service)
+			} else if err != nil {
+				return nil, err
+			}
 		}
 	}
 	return &services, nil
+}
+
+func (c *rolloutContext) getReferencedService(serviceName string, serviceType validation.ServiceType) (*validation.ServiceWithType, error) {
+	if serviceName != "" {
+		svc, err := c.servicesLister.Services(c.rollout.Namespace).Get(serviceName)
+		if k8serrors.IsNotFound(err) {
+			fldPath := validation.GetServiceWithTypeFieldPath(serviceType)
+			return nil, field.Invalid(fldPath, serviceName, err.Error())
+		}
+		if err != nil {
+			return nil, err
+		}
+		return &validation.ServiceWithType{Service: svc, Type: serviceType}, nil
+	}
+	return nil, nil
 }
 
 func (c *rolloutContext) getReferencedRolloutAnalyses() (*[]validation.AnalysisTemplatesWithType, error) {
@@ -744,6 +798,19 @@ func (c *rolloutContext) getReferencedIngresses() (*[]ingressutil.Ingress, error
 			}
 			ingresses = append(ingresses, *ingress)
 		} else if canary.TrafficRouting.Nginx != nil {
+			// If the rollout resource manages more than 1 ingress
+			if len(canary.TrafficRouting.Nginx.AdditionalStableIngresses) > 0 {
+				for _, ing := range canary.TrafficRouting.Nginx.AdditionalStableIngresses {
+					ingress, err := c.ingressWrapper.GetCached(c.rollout.Namespace, ing)
+					if k8serrors.IsNotFound(err) {
+						return nil, field.Invalid(fldPath.Child("nginx", "AdditionalStableIngresses"), canary.TrafficRouting.Nginx.StableIngress, err.Error())
+					}
+					if err != nil {
+						return nil, err
+					}
+					ingresses = append(ingresses, *ingress)
+				}
+			}
 			ingress, err := c.ingressWrapper.GetCached(c.rollout.Namespace, canary.TrafficRouting.Nginx.StableIngress)
 			if k8serrors.IsNotFound(err) {
 				return nil, field.Invalid(fldPath.Child("nginx", "stableIngress"), canary.TrafficRouting.Nginx.StableIngress, err.Error())

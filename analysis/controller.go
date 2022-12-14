@@ -3,6 +3,8 @@ package analysis
 import (
 	"time"
 
+	unstructuredutil "github.com/argoproj/argo-rollouts/utils/unstructured"
+
 	log "github.com/sirupsen/logrus"
 	batchv1 "k8s.io/api/batch/v1"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
@@ -22,6 +24,7 @@ import (
 	controllerutil "github.com/argoproj/argo-rollouts/utils/controller"
 	logutil "github.com/argoproj/argo-rollouts/utils/log"
 	"github.com/argoproj/argo-rollouts/utils/record"
+	timeutil "github.com/argoproj/argo-rollouts/utils/time"
 )
 
 // Controller is the controller implementation for Analysis resources
@@ -116,7 +119,14 @@ func NewController(cfg ControllerConfig) *Controller {
 		UpdateFunc: func(old, new interface{}) {
 			controller.enqueueAnalysis(new)
 		},
-		DeleteFunc: controller.enqueueAnalysis,
+		DeleteFunc: func(obj interface{}) {
+			controller.enqueueAnalysis(obj)
+			if ar := unstructuredutil.ObjectToAnalysisRun(obj); ar != nil {
+				logCtx := logutil.WithAnalysisRun(ar)
+				logCtx.Info("analysis run deleted")
+				controller.metricsServer.Remove(ar.Namespace, ar.Name, logutil.AnalysisRunKey)
+			}
+		},
 	})
 	return controller
 }
@@ -136,7 +146,7 @@ func (c *Controller) Run(threadiness int, stopCh <-chan struct{}) error {
 }
 
 func (c *Controller) syncHandler(key string) error {
-	startTime := time.Now()
+	startTime := timeutil.Now()
 	namespace, name, err := cache.SplitMetaNamespaceKey(key)
 	if err != nil {
 		return err

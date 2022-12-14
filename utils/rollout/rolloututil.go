@@ -4,6 +4,8 @@ import (
 	"fmt"
 	"strconv"
 
+	replicasetutil "github.com/argoproj/argo-rollouts/utils/replicaset"
+
 	"github.com/argoproj/argo-rollouts/pkg/apis/rollouts/v1alpha1"
 	"github.com/argoproj/argo-rollouts/utils/annotations"
 	"github.com/argoproj/argo-rollouts/utils/conditions"
@@ -23,7 +25,9 @@ func GetRolloutPhase(ro *v1alpha1.Rollout) (v1alpha1.RolloutPhase, string) {
 	if !isGenerationObserved(ro) {
 		return v1alpha1.RolloutPhaseProgressing, "waiting for rollout spec update to be observed"
 	}
-
+	if IsUnpausing(ro) {
+		return v1alpha1.RolloutPhaseProgressing, "waiting for rollout to unpause"
+	}
 	if ro.Spec.TemplateResolvedFromRef && !isWorkloadGenerationObserved(ro) {
 		return v1alpha1.RolloutPhaseProgressing, "waiting for rollout spec update to be observed for the reference workload"
 	}
@@ -49,6 +53,17 @@ func isGenerationObserved(ro *v1alpha1.Rollout) bool {
 		return true
 	}
 	return int64(observedGen) == ro.Generation
+}
+
+// IsUnpausing detects if we are in the process of unpausing a rollout. This is determined by seeing
+// if status.controllerPause is true, but the list of pause conditions (status.pauseConditions)
+// is empty. This implies that a user cleared the pause conditions but controller has not yet
+// observed or reacted to it.
+// NOTE: this function is necessary because unlike metadata.generation & status.observedGeneration
+// status.controllerPause & status.pauseConditions are both status fields and does not benefit from
+// the auto-incrementing behavior of metadata.generation.
+func IsUnpausing(ro *v1alpha1.Rollout) bool {
+	return ro.Status.ControllerPause && len(ro.Status.PauseConditions) == 0
 }
 
 func isWorkloadGenerationObserved(ro *v1alpha1.Rollout) bool {
@@ -165,4 +180,17 @@ func CanaryStepString(c v1alpha1.CanaryStep) string {
 		}
 	}
 	return "invalid"
+}
+
+// ShouldVerifyWeight We use this to test if we should verify weights because weight verification could involve
+// API calls to the cloud provider which could incur rate limiting
+func ShouldVerifyWeight(ro *v1alpha1.Rollout) bool {
+	currentStep, _ := replicasetutil.GetCurrentCanaryStep(ro)
+	// If we are in the middle of an update at a setWeight step, also perform weight verification.
+	// Note that we don't do this every reconciliation because weight verification typically involves
+	// API calls to the cloud provider which could incur rate limitingq
+	shouldVerifyWeight := ro.Status.StableRS != "" &&
+		!IsFullyPromoted(ro) &&
+		currentStep != nil && currentStep.SetWeight != nil
+	return shouldVerifyWeight
 }

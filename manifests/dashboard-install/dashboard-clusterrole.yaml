@@ -43,6 +43,15 @@ rules:
   - apiGroups:
       - apps
     resources:
+      - deployments
+    verbs:
+      - get
+      - update
+      - list
+      - watch
+  - apiGroups:
+      - apps
+    resources:
       - replicasets
     verbs:
       - get

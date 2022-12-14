@@ -36,6 +36,15 @@ const (
 	// DefaultConsecutiveErrorLimit is the default number times a metric can error in sequence before
 	// erroring the entire metric.
 	DefaultConsecutiveErrorLimit int32 = 4
+	// DefaultQPS is the default Queries Per Second (QPS) for client side throttling to the K8s API server
+	DefaultQPS float32 = 40.0
+	// DefaultBurst is the default value for Burst for client side throttling to the K8s API server
+	DefaultBurst int = 80
+	// DefaultAwsLoadBalancerPageSize is the default page size used when calling aws to get load balancers by DNS name
+	DefaultAwsLoadBalancerPageSize = int32(300)
+	// DefaultMetricCleanupDelay is the default time to delay metrics removal upon object removal, gives time for metrics
+	// to be collected
+	DefaultMetricCleanupDelay = int32(65)
 )
 
 const (
@@ -44,6 +53,9 @@ const (
 	DefaultIstioVersion                 = "v1alpha3"
 	DefaultSMITrafficSplitVersion       = "v1alpha1"
 	DefaultTargetGroupBindingAPIVersion = "elbv2.k8s.aws/v1beta1"
+	DefaultAppMeshCRDVersion            = "v1beta2"
+	DefaultTraefikAPIGroup              = "traefik.containo.us"
+	DefaultTraefikVersion               = "traefik.containo.us/v1alpha1"
 )
 
 var (
@@ -52,6 +64,8 @@ var (
 	ambassadorAPIVersion         = DefaultAmbassadorVersion
 	smiAPIVersion                = DefaultSMITrafficSplitVersion
 	targetGroupBindingAPIVersion = DefaultTargetGroupBindingAPIVersion
+	appmeshCRDVersion            = DefaultAppMeshCRDVersion
+	defaultMetricCleanupDelay    = DefaultMetricCleanupDelay
 )
 
 const (
@@ -68,6 +82,14 @@ func init() {
 		if interval, err := strconv.ParseInt(rolloutVerifyInterval, 10, 32); err != nil {
 			rolloutVerifyRetryInterval = time.Duration(interval) * time.Second
 		}
+	}
+}
+
+func GetStringOrDefault(value, defaultValue string) string {
+	if value == "" {
+		return defaultValue
+	} else {
+		return value
 	}
 }
 
@@ -259,6 +281,14 @@ func GetAmbassadorAPIVersion() string {
 	return ambassadorAPIVersion
 }
 
+func SetAppMeshCRDVersion(apiVersion string) {
+	appmeshCRDVersion = apiVersion
+}
+
+func GetAppMeshCRDVersion() string {
+	return appmeshCRDVersion
+}
+
 func SetSMIAPIVersion(apiVersion string) {
 	smiAPIVersion = apiVersion
 }
@@ -277,4 +307,14 @@ func GetTargetGroupBindingAPIVersion() string {
 
 func GetRolloutVerifyRetryInterval() time.Duration {
 	return rolloutVerifyRetryInterval
+}
+
+// GetMetricCleanupDelaySeconds returns the duration to delay the cleanup of metrics
+func GetMetricCleanupDelaySeconds() time.Duration {
+	return time.Duration(defaultMetricCleanupDelay) * time.Second
+}
+
+// SetMetricCleanupDelaySeconds sets the metric cleanup delay in seconds
+func SetMetricCleanupDelaySeconds(seconds int32) {
+	defaultMetricCleanupDelay = seconds
 }
