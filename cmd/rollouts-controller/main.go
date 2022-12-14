@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	smiclientset "github.com/servicemeshinterface/smi-sdk-go/pkg/gen/client/split/clientset/versioned"
@@ -36,7 +37,9 @@ import (
 
 const (
 	// CLIName is the name of the CLI
-	cliName = "argo-rollouts"
+	cliName    = "argo-rollouts"
+	jsonFormat = "json"
+	textFormat = "text"
 )
 
 func newCommand() *cobra.Command {
@@ -44,10 +47,13 @@ func newCommand() *cobra.Command {
 		clientConfig         clientcmd.ClientConfig
 		rolloutResyncPeriod  int64
 		logLevel             string
+		logFormat            string
 		klogLevel            int
 		metricsPort          int
 		healthzPort          int
 		instanceID           string
+		qps                  float32
+		burst                int
 		rolloutThreads       int
 		experimentThreads    int
 		analysisThreads      int
@@ -57,6 +63,7 @@ func newCommand() *cobra.Command {
 		trafficSplitVersion  string
 		ambassadorVersion    string
 		ingressVersion       string
+		appmeshCRDVersion    string
 		albIngressClasses    []string
 		nginxIngressClasses  []string
 		awsVerifyTargetGroup bool
@@ -73,10 +80,9 @@ func newCommand() *cobra.Command {
 				return nil
 			}
 			setLogLevel(logLevel)
-			formatter := &log.TextFormatter{
-				FullTimestamp: true,
+			if logFormat != "" {
+				log.SetFormatter(createFormatter(logFormat))
 			}
-			log.SetFormatter(formatter)
 			logutil.SetKLogLevel(klogLevel)
 			log.WithField("version", version.GetVersion()).Info("Argo Rollouts starting")
 
@@ -87,9 +93,12 @@ func newCommand() *cobra.Command {
 			defaults.SetIstioAPIVersion(istioVersion)
 			defaults.SetAmbassadorAPIVersion(ambassadorVersion)
 			defaults.SetSMIAPIVersion(trafficSplitVersion)
+			defaults.SetAppMeshCRDVersion(appmeshCRDVersion)
 
 			config, err := clientConfig.ClientConfig()
 			checkError(err)
+			config.QPS = qps
+			config.Burst = burst
 			namespace := metav1.NamespaceAll
 			configNS, _, err := clientConfig.Namespace()
 			checkError(err)
@@ -97,6 +106,9 @@ func newCommand() *cobra.Command {
 				namespace = configNS
 				log.Infof("Using namespace %s", namespace)
 			}
+
+			k8sRequestProvider := &metrics.K8sRequestsCountProvider{}
+			kubeclientmetrics.AddMetricsTransportWrapper(config, k8sRequestProvider.IncKubernetesRequest)
 
 			kubeClient, err := kubernetes.NewForConfig(config)
 			checkError(err)
@@ -145,8 +157,6 @@ func newCommand() *cobra.Command {
 			configMapInformer := controllerNamespaceInformerFactory.Core().V1().ConfigMaps()
 			secretInformer := controllerNamespaceInformerFactory.Core().V1().Secrets()
 
-			k8sRequestProvider := &metrics.K8sRequestsCountProvider{}
-			kubeclientmetrics.AddMetricsTransportWrapper(config, k8sRequestProvider.IncKubernetesRequest)
 			mode, err := ingressutil.DetermineIngressMode(ingressVersion, kubeClient.DiscoveryClient)
 			checkError(err)
 			ingressWrapper, err := ingressutil.NewIngressWrapper(mode, kubeClient, kubeInformerFactory)
@@ -209,10 +219,13 @@ func newCommand() *cobra.Command {
 	command.Flags().Int64Var(&rolloutResyncPeriod, "rollout-resync", controller.DefaultRolloutResyncPeriod, "Time period in seconds for rollouts resync.")
 	command.Flags().BoolVar(&namespaced, "namespaced", false, "runs controller in namespaced mode (does not require cluster RBAC)")
 	command.Flags().StringVar(&logLevel, "loglevel", "info", "Set the logging level. One of: debug|info|warn|error")
+	command.Flags().StringVar(&logFormat, "logformat", "", "Set the logging format. One of: text|json")
 	command.Flags().IntVar(&klogLevel, "kloglevel", 0, "Set the klog logging level")
 	command.Flags().IntVar(&metricsPort, "metricsport", controller.DefaultMetricsPort, "Set the port the metrics endpoint should be exposed over")
 	command.Flags().IntVar(&healthzPort, "healthzPort", controller.DefaultHealthzPort, "Set the port the healthz endpoint should be exposed over")
 	command.Flags().StringVar(&instanceID, "instance-id", "", "Indicates which argo rollout objects the controller should operate on")
+	command.Flags().Float32Var(&qps, "qps", defaults.DefaultQPS, "Maximum QPS (queries per second) to the K8s API server")
+	command.Flags().IntVar(&burst, "burst", defaults.DefaultBurst, "Maximum burst for throttle.")
 	command.Flags().IntVar(&rolloutThreads, "rollout-threads", controller.DefaultRolloutThreads, "Set the number of worker threads for the Rollout controller")
 	command.Flags().IntVar(&experimentThreads, "experiment-threads", controller.DefaultExperimentThreads, "Set the number of worker threads for the Experiment controller")
 	command.Flags().IntVar(&analysisThreads, "analysis-threads", controller.DefaultAnalysisThreads, "Set the number of worker threads for the Experiment controller")
@@ -222,6 +235,7 @@ func newCommand() *cobra.Command {
 	command.Flags().StringVar(&ambassadorVersion, "ambassador-api-version", defaults.DefaultAmbassadorVersion, "Set the Ambassador apiVersion that controller should look when manipulating Ambassador Mappings.")
 	command.Flags().StringVar(&trafficSplitVersion, "traffic-split-api-version", defaults.DefaultSMITrafficSplitVersion, "Set the default TrafficSplit apiVersion that controller uses when creating TrafficSplits.")
 	command.Flags().StringVar(&ingressVersion, "ingress-api-version", "", "Set the Ingress apiVersion that the controller should use.")
+	command.Flags().StringVar(&appmeshCRDVersion, "appmesh-crd-version", defaults.DefaultAppMeshCRDVersion, "Set the default AppMesh CRD Version that controller uses when manipulating resources.")
 	command.Flags().StringArrayVar(&albIngressClasses, "alb-ingress-classes", defaultALBIngressClass, "Defines all the ingress class annotations that the alb ingress controller operates on. Defaults to alb")
 	command.Flags().StringArrayVar(&nginxIngressClasses, "nginx-ingress-classes", defaultNGINXIngressClass, "Defines all the ingress class annotations that the nginx ingress controller operates on. Defaults to nginx")
 	command.Flags().BoolVar(&awsVerifyTargetGroup, "alb-verify-weight", false, "Verify ALB target group weights before progressing through steps (requires AWS privileges)")
@@ -229,7 +243,6 @@ func newCommand() *cobra.Command {
 	command.Flags().BoolVar(&awsVerifyTargetGroup, "aws-verify-target-group", false, "Verify ALB target group before progressing through steps (requires AWS privileges)")
 	command.Flags().BoolVar(&printVersion, "version", false, "Print version")
 	command.Flags().BoolVar(&electOpts.LeaderElect, "leader-elect", controller.DefaultLeaderElect, "If true, controller will perform leader election between instances to ensure no more than one instance of controller operates at a time")
-	command.Flags().StringVar(&electOpts.LeaderElectionNamespace, "leader-election-namespace", controller.DefaultLeaderElectionNamespace, "Namespace used to perform leader election. Only used if leader election is enabled")
 	command.Flags().DurationVar(&electOpts.LeaderElectionLeaseDuration, "leader-election-lease-duration", controller.DefaultLeaderElectionLeaseDuration, "The duration that non-leader candidates will wait after observing a leadership renewal until attempting to acquire leadership of a led but unrenewed leader slot. This is effectively the maximum duration that a leader can be stopped before it is replaced by another candidate. This is only applicable if leader election is enabled.")
 	command.Flags().DurationVar(&electOpts.LeaderElectionRenewDeadline, "leader-election-renew-deadline", controller.DefaultLeaderElectionRenewDeadline, "The interval between attempts by the acting master to renew a leadership slot before it stops leading. This must be less than or equal to the lease duration. This is only applicable if leader election is enabled.")
 	command.Flags().DurationVar(&electOpts.LeaderElectionRetryPeriod, "leader-election-retry-period", controller.DefaultLeaderElectionRetryPeriod, "The duration the clients should wait between attempting acquisition and renewal of a leadership. This is only applicable if leader election is enabled.")
@@ -260,6 +273,25 @@ func setLogLevel(logLevel string) {
 		log.Fatal(err)
 	}
 	log.SetLevel(level)
+}
+
+func createFormatter(logFormat string) log.Formatter {
+	var formatType log.Formatter
+	switch strings.ToLower(logFormat) {
+	case jsonFormat:
+		formatType = &log.JSONFormatter{}
+	case textFormat:
+		formatType = &log.TextFormatter{
+			FullTimestamp: true,
+		}
+	default:
+		log.Infof("Unknown format: %s. Using text logformat", logFormat)
+		formatType = &log.TextFormatter{
+			FullTimestamp: true,
+		}
+	}
+
+	return formatType
 }
 
 func checkError(err error) {

@@ -76,9 +76,6 @@ const (
 	// DefaultLeaderElect is the default true leader election should be enabled
 	DefaultLeaderElect = true
 
-	// DefaultLeaderElectionNamespace is the default namespace used to perform leader election. Only used if leader election is enabled
-	DefaultLeaderElectionNamespace = "kube-system"
-
 	// DefaultLeaderElectionLeaseDuration is the default time in seconds that non-leader candidates will wait to force acquire leadership
 	DefaultLeaderElectionLeaseDuration = 15 * time.Second
 
@@ -103,7 +100,7 @@ type LeaderElectionOptions struct {
 func NewLeaderElectionOptions() *LeaderElectionOptions {
 	return &LeaderElectionOptions{
 		LeaderElect:                 DefaultLeaderElect,
-		LeaderElectionNamespace:     DefaultLeaderElectionNamespace,
+		LeaderElectionNamespace:     defaults.Namespace(),
 		LeaderElectionLeaseDuration: DefaultLeaderElectionLeaseDuration,
 		LeaderElectionRenewDeadline: DefaultLeaderElectionRenewDeadline,
 		LeaderElectionRetryPeriod:   DefaultLeaderElectionRetryPeriod,
@@ -202,7 +199,7 @@ func NewManager(
 
 	refResolver := rollout.NewInformerBasedWorkloadRefResolver(namespace, dynamicclientset, discoveryClient, argoprojclientset, rolloutsInformer.Informer())
 	apiFactory := notificationapi.NewFactory(record.NewAPIFactorySettings(), defaults.Namespace(), secretInformer.Informer(), configMapInformer.Informer())
-	recorder := record.NewEventRecorder(kubeclientset, metrics.MetricRolloutEventsTotal, apiFactory)
+	recorder := record.NewEventRecorder(kubeclientset, metrics.MetricRolloutEventsTotal, metrics.MetricNotificationFailedTotal, metrics.MetricNotificationSuccessTotal, metrics.MetricNotificationSend, apiFactory)
 	notificationsController := notificationcontroller.NewController(dynamicclientset.Resource(v1alpha1.RolloutGVR), rolloutsInformer.Informer(), apiFactory,
 		notificationcontroller.WithToUnstructured(func(obj metav1.Object) (*unstructured.Unstructured, error) {
 			data, err := json.Marshal(obj)
